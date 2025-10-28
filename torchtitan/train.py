@@ -487,20 +487,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     model_output = model_parts[0](
                         inputs, **extra_inputs, **extra_kwargs
                     )
-                    # Handle both old (logits only) and new (logits, kl_loss) signatures
-                    if isinstance(model_output, tuple):
-                        pred, kl_loss = model_output
-                    else:
-                        pred, kl_loss = model_output, 0.0
-
-                    # Get kl_weight from config with fallback to 0.1
-                    kl_weight = getattr(self.job_config.training, "kl_weight", 0.1)
-
-                    # Combine main loss with weighted KL loss
-                    main_loss = self.loss_fn(pred, labels)
-                    loss = main_loss + kl_weight * kl_loss
-                # need to free pred before bwd to avoid peaking memory
-                del pred
+                    # loss_fn handles both tuple (logits, kl_loss) and single logits
+                    loss = self.loss_fn(model_output, labels)
+                # need to free model_output before bwd to avoid peaking memory
+                del model_output
                 loss.backward()
 
         return loss
