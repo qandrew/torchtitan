@@ -237,10 +237,9 @@ class Attention(nn.Module):
         attn_scores = torch.matmul(xq, xk.transpose(-2, -1)) * self.scaling
         # Apply causal mask
         causal_mask = torch.triu(
-            torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device),
-            diagonal=1
+            torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device), diagonal=1
         )
-        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+        attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
         # Baseline attention weights: (bs, n_local_heads, seqlen, seqlen)
         baseline_attn_weights = F.softmax(attn_scores, dim=-1)
         # Average over heads: (bs, seqlen, seqlen)
@@ -250,18 +249,16 @@ class Attention(nn.Module):
         # approx_logits: (bs, seqlen, dim)
         approx_logits = self.attn_approximator(x)
         # Compute attention scores: (bs, seqlen, seqlen)
-        approx_scores = torch.matmul(approx_logits, x.transpose(-2, -1)) / (dim ** 0.5)
+        approx_scores = torch.matmul(approx_logits, x.transpose(-2, -1)) / (dim**0.5)
         # Apply causal mask
-        approx_scores = approx_scores.masked_fill(causal_mask, float('-inf'))
+        approx_scores = approx_scores.masked_fill(causal_mask, float("-inf"))
         # Approximator attention weights: (bs, seqlen, seqlen)
         approx_attn_weights = F.softmax(approx_scores, dim=-1)
 
         # Compute KL divergence: KL(approx || baseline)
         # F.kl_div expects log-probabilities as input and probabilities as target
         kl_loss = F.kl_div(
-            torch.log(approx_attn_weights + eps),
-            baseline_avg,
-            reduction='batchmean'
+            torch.log(approx_attn_weights + eps), baseline_avg, reduction="batchmean"
         )
 
         if self.use_flex_attn:
@@ -380,7 +377,9 @@ class TransformerBlock(nn.Module):
             tuple: (output tensor after applying attention and feedforward layers, kl_loss)
 
         """
-        attn_out, kl_loss = self.attention(self.attention_norm(x), rope_cache, attention_masks)
+        attn_out, kl_loss = self.attention(
+            self.attention_norm(x), rope_cache, attention_masks
+        )
         x = x + attn_out
 
         if self.moe_enabled:
