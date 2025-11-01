@@ -167,6 +167,9 @@ class Attention(nn.Module):
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
+        # Attention approximator: lightweight trainable component
+        self.attn_approximator = nn.Linear(model_args.dim, model_args.dim, bias=True)
+
         if self.use_flex_attn:
             self.inner_attention = FlexAttentionWrapper()
         else:
@@ -176,6 +179,9 @@ class Attention(nn.Module):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+        # Initialize approximator
+        nn.init.trunc_normal_(self.attn_approximator.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.attn_approximator.bias)
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
         if self.k_norm is not None:
@@ -194,11 +200,11 @@ class Attention(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            torch.Tensor: Output tensor after attention.
+            tuple: (output tensor after attention, kl_loss)
 
         """
-
-        bs, seqlen, _ = x.shape
+        eps = 1e-8
+        bs, seqlen, dim = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
@@ -226,6 +232,35 @@ class Attention(nn.Module):
         xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
+        # Compute baseline attention weights for KL divergence
+        # attn_scores: (bs, n_local_heads, seqlen, seqlen)
+        attn_scores = torch.matmul(xq, xk.transpose(-2, -1)) * self.scaling
+        # Apply causal mask
+        causal_mask = torch.triu(
+            torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device), diagonal=1
+        )
+        attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+        # Baseline attention weights: (bs, n_local_heads, seqlen, seqlen)
+        baseline_attn_weights = F.softmax(attn_scores, dim=-1)
+        # Average over heads: (bs, seqlen, seqlen)
+        baseline_avg = baseline_attn_weights.mean(dim=1)
+
+        # Compute approximator attention scores
+        # approx_logits: (bs, seqlen, dim)
+        approx_logits = self.attn_approximator(x)
+        # Compute attention scores: (bs, seqlen, seqlen)
+        approx_scores = torch.matmul(approx_logits, x.transpose(-2, -1)) / (dim**0.5)
+        # Apply causal mask
+        approx_scores = approx_scores.masked_fill(causal_mask, float("-inf"))
+        # Approximator attention weights: (bs, seqlen, seqlen)
+        approx_attn_weights = F.softmax(approx_scores, dim=-1)
+
+        # Compute KL divergence: KL(approx || baseline)
+        # F.kl_div expects log-probabilities as input and probabilities as target
+        kl_loss = F.kl_div(
+            torch.log(approx_attn_weights + eps), baseline_avg, reduction="batchmean"
+        )
+
         if self.use_flex_attn:
             assert isinstance(attention_masks, BlockMask), attention_masks
             output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
@@ -238,7 +273,7 @@ class Attention(nn.Module):
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
 
         output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        return self.wo(output), kl_loss
 
 
 class FeedForward(nn.Module):
@@ -339,16 +374,19 @@ class TransformerBlock(nn.Module):
             rope_cache (torch.Tensor): Precomputed cosine and sine frequencies.
 
         Returns:
-            torch.Tensor: Output tensor after applying attention and feedforward layers.
+            tuple: (output tensor after applying attention and feedforward layers, kl_loss)
 
         """
-        x = x + self.attention(self.attention_norm(x), rope_cache, attention_masks)
+        attn_out, kl_loss = self.attention(
+            self.attention_norm(x), rope_cache, attention_masks
+        )
+        x = x + attn_out
 
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+        return x, kl_loss
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.attention_norm, self.ffn_norm):
@@ -376,6 +414,15 @@ class Qwen3Model(nn.Module, ModelProtocol):
         norm (RMSNorm): Layer normalization for the model output.
         output (ColumnParallelLinear): Linear layer for final output.
         freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+    Note:
+        To train only the attention approximator and freeze all other parameters,
+        add this code after model construction:
+
+        # Freeze all parameters except approximator
+        # for name, param in model.named_parameters():
+        #     if 'attn_approximator' not in name:
+        #         param.requires_grad = False
 
     """
 
@@ -481,15 +528,17 @@ class Qwen3Model(nn.Module, ModelProtocol):
                 previous pipeline stage if the current rank is not on the first stage.
 
         Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
+            tuple: (output logits after applying the Transformer model, total_kl_loss)
 
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
+        total_kl_loss = 0.0
         for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks)
+            h, kl_loss = layer(h, self.rope_cache, attention_masks)
+            total_kl_loss = total_kl_loss + kl_loss
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
-        return output
+        return output, total_kl_loss

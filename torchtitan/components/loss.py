@@ -16,6 +16,24 @@ from torchtitan.tools.logging import logger
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
+class KLAwareLoss:
+    """Wrapper for loss function that handles KL divergence from attention approximator."""
+
+    def __init__(self, unwrapped_loss_fn, kl_weight: float = 0.1):
+        self.unwrapped_loss_fn = unwrapped_loss_fn
+        self.kl_weight = kl_weight
+        functools.update_wrapper(self, unwrapped_loss_fn, updated=tuple())
+
+    def __call__(self, pred, labels):
+        # Handle tuple output from model (logits, kl_loss)
+        if isinstance(pred, tuple):
+            logits, kl_loss = pred
+            main_loss = self.unwrapped_loss_fn(logits, labels)
+            return main_loss + self.kl_weight * kl_loss
+        # Backward compatibility: if pred is not a tuple, just compute main loss
+        return self.unwrapped_loss_fn(pred, labels)
+
+
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Common cross-entropy loss function for Transformer models training."""
     return torch.nn.functional.cross_entropy(
@@ -29,6 +47,11 @@ def build_cross_entropy_loss(job_config: JobConfig, **kwargs):
     if job_config.compile.enable and "loss" in job_config.compile.components:
         logger.info("Compiling the loss function with torch.compile")
         loss_fn = torch.compile(loss_fn, backend=job_config.compile.backend)
+
+    # Wrap with KL-aware loss if kl_weight is configured
+    kl_weight = getattr(job_config.training, "kl_weight", 0.1)
+    loss_fn = KLAwareLoss(loss_fn, kl_weight)
+
     return loss_fn
 
 
