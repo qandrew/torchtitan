@@ -168,6 +168,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         color = self.metrics_processor.color
 
+        # Local - Optionally disable all layers except the attention approximator
+        for name, param in model.named_parameters():
+            if 'attn_approximator' not in name:
+                param.requires_grad = False
+
         # calculate model size and flops per token
         (
             model_param_count,
@@ -423,6 +428,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # extra_kwargs are.
         extra_kwargs = {}
 
+        kl_weight = getattr(self.job_config.training, "kl_weight", 0.1)
+
         if getattr(self.model_args, "use_flex_attn", False):
             extra_kwargs["attention_masks"] = model_parts[0].get_attention_masks(
                 input_batch=inputs,
@@ -482,8 +489,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                    loss = self.loss_fn(pred, labels)
+                    pred, kl_loss = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+                    loss = self.loss_fn(pred, labels) + kl_weight * kl_loss
                 # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()

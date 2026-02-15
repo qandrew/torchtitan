@@ -24,8 +24,11 @@ from torchtitan.models.moe import MoE
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
 
+import math
+
 from .args import Qwen3ModelArgs
 
+eps = 1e-8
 
 # Adapted from https://github.com/pytorch/torchtune/blob/main/torchtune/models/qwen2/_positional_embeddings.py
 def precompute_rope_cache(
@@ -172,6 +175,15 @@ class Attention(nn.Module):
         else:
             self.inner_attention = ScaledDotProductAttentionWrapper()
 
+        # For the Indexer
+        self.dim = model_args.dim
+        self.attn_approximator = nn.Linear(model_args.dim, model_args.dim, bias=True)
+
+        self.max_seq_len = model_args.max_seq_len
+        self.causal_mask = torch.zeros(self.max_seq_len, self.max_seq_len) # set device/dtype?
+        temp_mask = torch.ones(self.max_seq_len, self.max_seq_len, dtype=torch.bool).tril(diagonal=0)
+        self.causal_mask.masked_fill_(temp_mask.logical_not(), float("-inf")) # init mask once to avoid expensive reconstruction
+
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -180,6 +192,9 @@ class Attention(nn.Module):
             self.q_norm.reset_parameters()
         if self.k_norm is not None:
             self.k_norm.reset_parameters()
+
+        nn.init.trunc_normal_(self.attn_approximator.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.attn_approximator.bias, mean=0.0, std=0.02)
 
     def forward(
         self,
@@ -238,7 +253,39 @@ class Attention(nn.Module):
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
 
         output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+
+        """
+        Compute the loss for the Indexer.
+
+        Our goal is to closely, cheaply approximate the softmax distribution over q @ k.T - enabling
+        us to compute only the most valuable subset of full attention qkv computations
+        """
+
+        if seqlen == self.max_seq_len:
+            causal_mask = self.causal_mask
+        else:
+            causal_mask = torch.zeros(seqlen, seqlen, dtype=x.dtype, device=x.device)
+            temp_mask = torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device).tril(diagonal=0)
+            causal_mask.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+        attn_scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(xq.shape[-1])
+        attn_scores += causal_mask
+        attn_scores = F.softmax(attn_scores, dim = -1)
+
+        baseline_avg = torch.mean(attn_scores, dim=1).detach() # avg across heads, can be modified to support multi-head indexing
+
+        # note - if our goal is to use this layer to power a top-k selector, we only need to compute loss on the ranking? Can maybe weight this ranking with the value vector?
+        # Not the actual dim-length vectors, or potentially even on the actual magnitude value we'll use for comparison.
+        # KL makes sense for comparing the loss of the actual probability distribution, but curious about whether we can reduce the dimensionality...
+        # (or whether reducing the dimensionality is good lol)
+        approx_logits = self.attn_approximator(x)
+        approx = (approx_logits @ x.transpose(-2, -1)) / math.sqrt(approx_logits.shape[-1]) # why do we do this matmul with x?
+        approx += causal_mask 
+        approx = F.softmax(approx + eps, dim=-1)
+        
+        kl_loss = F.kl_div(torch.log(approx + eps), baseline_avg, reduction="batchmean")
+
+        return self.wo(output), kl_loss
 
 
 class FeedForward(nn.Module):
@@ -342,13 +389,15 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        x = x + self.attention(self.attention_norm(x), rope_cache, attention_masks)
+        attn, kl_loss = self.attention(self.attention_norm(x), rope_cache, attention_masks)
+        x = x + attn
 
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+
+        return x, kl_loss
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.attention_norm, self.ffn_norm):
@@ -486,10 +535,12 @@ class Qwen3Model(nn.Module, ModelProtocol):
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        kl_loss = 0
 
         for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks)
+            h, layer_kl_loss = layer(h, self.rope_cache, attention_masks)
+            kl_loss += layer_kl_loss
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
-        return output
+        return output, kl_loss
